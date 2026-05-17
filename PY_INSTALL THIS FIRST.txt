@@ -1,0 +1,1 @@
+pip install pyautogui psutil py7zr requests requests-toolbelt pillow py3createtorrent
