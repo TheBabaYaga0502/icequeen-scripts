@@ -427,87 +427,161 @@ def upload_to_1fichier(file_path, max_retries=3):
 
 
 def upload_to_rootz(file_path, max_retries=3):
-    """Uploads a file to Rootz with progress bar and retry logic."""
+    """Uploads a file to Rootz using their S3-style multipart protocol.
+
+    Rootz stores files on Cloudflare R2 and routes single-shot POSTs through
+    the Cloudflare edge, which caps request bodies at ~100 MB. The multipart
+    API hands the client per-part presigned R2 URLs so chunks bypass that
+    edge limit entirely. See /api/files/multipart/{init,part-url,complete,abort}.
+    """
     print(f"\nUploading to Rootz: {file_path}...")
-    url = "https://rootz.so/api/files/upload"
+    base = "https://rootz.so/api/files/multipart"
+    headers = {"Authorization": f"Bearer {ROOTZ_API_KEY}"}
     file_size = os.path.getsize(file_path)
     filename = os.path.basename(file_path)
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            with open(file_path, "rb") as f:
-                encoder = MultipartEncoder(
-                    fields={"file": (filename, f, "application/zip")}
-                )
-                monitor = MultipartEncoderMonitor(encoder, create_progress_callback(file_size))
+    # 1. Init session
+    try:
+        r = requests.post(
+            f"{base}/init",
+            json={"fileName": filename, "fileSize": file_size, "mimeType": "application/zip"},
+            headers=headers,
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"Rootz init error: {e}")
+        return None
+    if r.status_code != 200:
+        print(f"Rootz init failed: HTTP {r.status_code} {r.text[:300]}")
+        return None
+    init = r.json()
+    if not init.get("success"):
+        print(f"Rootz init failed: {init}")
+        return None
 
-                response = requests.post(
-                    url,
-                    data=monitor,
-                    headers={
-                        "Content-Type": monitor.content_type,
-                        "Authorization": f"Bearer {ROOTZ_API_KEY}"
+    upload_id = init["uploadId"]
+    key = init["key"]
+    chunk_size = init["chunkSize"]
+    total_parts = init["totalParts"]
+    print(f"Rootz multipart: {total_parts} part(s) x {format_size(chunk_size)}")
+
+    parts = []
+    bytes_uploaded = 0
+
+    def _draw_progress():
+        percent = (bytes_uploaded / file_size) * 100 if file_size else 100.0
+        bar_length = 50
+        filled = int(percent / 2)
+        bar = '#' * filled + '-' * (bar_length - filled)
+        sys.stdout.write(
+            f"\rUploading: [{bar}] {percent:.1f}% "
+            f"({format_size(bytes_uploaded)}/{format_size(file_size)})"
+        )
+        sys.stdout.flush()
+
+    try:
+        with open(file_path, "rb") as f:
+            for part_number in range(1, total_parts + 1):
+                # 2a. Presigned URL for this part (with retry)
+                part_url = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        rurl = requests.post(
+                            f"{base}/part-url",
+                            json={"uploadId": upload_id, "key": key, "partNumber": part_number},
+                            headers=headers,
+                            timeout=60,
+                        )
+                        if rurl.status_code == 200 and rurl.json().get("success"):
+                            part_url = rurl.json()["url"]
+                            break
+                        raise RuntimeError(f"HTTP {rurl.status_code} {rurl.text[:200]}")
+                    except Exception as e:
+                        if attempt < max_retries:
+                            time.sleep(attempt * 2)
+                            continue
+                        raise RuntimeError(f"could not get URL for part {part_number}: {e}")
+
+                # Read chunk from disk
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    raise RuntimeError(f"unexpected EOF at part {part_number}")
+
+                # 2b. PUT chunk to R2 (with retry)
+                etag = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        rput = requests.put(
+                            part_url,
+                            data=chunk,
+                            headers={
+                                "Content-Type": "application/octet-stream",
+                                "Content-Length": str(len(chunk)),
+                            },
+                            timeout=1800,
+                        )
+                        if rput.status_code == 200:
+                            etag_raw = rput.headers.get("ETag", "").strip().strip('"')
+                            if etag_raw:
+                                etag = etag_raw
+                                break
+                            raise RuntimeError("missing ETag in PUT response")
+                        raise RuntimeError(f"HTTP {rput.status_code} {rput.text[:200]}")
+                    except Exception as e:
+                        if attempt < max_retries:
+                            time.sleep(attempt * 2)
+                            continue
+                        raise RuntimeError(f"PUT failed for part {part_number}: {e}")
+
+                parts.append({"partNumber": part_number, "etag": etag})
+                bytes_uploaded += len(chunk)
+                _draw_progress()
+
+        print("")  # Newline after progress bar
+
+        # 3. Complete (with retry)
+        for attempt in range(1, max_retries + 1):
+            try:
+                rcomp = requests.post(
+                    f"{base}/complete",
+                    json={
+                        "uploadId": upload_id,
+                        "key": key,
+                        "parts": parts,
+                        "fileName": filename,
+                        "fileSize": file_size,
+                        "mimeType": "application/zip",
                     },
-                    timeout=3600  # 1 hour for large files
+                    headers=headers,
+                    timeout=300,
                 )
-
-            print("")  # New line after progress bar
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    short_id = data["data"].get("shortId")
-                    if short_id:
-                        link = f"https://rootz.so/d/{short_id}"
-                    else:
-                        # Fallback to file id if shortId not available
-                        file_id = data["data"].get("id", "")
-                        link = f"https://rootz.so/d/{file_id}"
+                if rcomp.status_code == 200 and rcomp.json().get("success"):
+                    info = rcomp.json().get("file", {})
+                    short_id = info.get("shortId") or info.get("id", "")
+                    link = f"https://rootz.so/d/{short_id}"
                     print(f"Rootz upload successful: {link}")
                     return link
-                else:
-                    error_msg = data.get("error", "unknown error")
-                    if attempt < max_retries:
-                        wait_time = attempt * 2
-                        print(f"Rootz upload failed: {error_msg} (attempt {attempt}/{max_retries}), retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        print(f"Rootz upload failed: {data}")
-                        return None
-            else:
+                raise RuntimeError(f"HTTP {rcomp.status_code} {rcomp.text[:300]}")
+            except Exception as e:
                 if attempt < max_retries:
-                    wait_time = attempt * 2
-                    print(f"Rootz upload failed with status {response.status_code} (attempt {attempt}/{max_retries}), retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                    time.sleep(attempt * 2)
                     continue
-                else:
-                    print(f"Rootz upload failed with status code: {response.status_code}")
-                    try:
-                        print(f"Response: {response.text[:300]}")
-                    except:
-                        pass
-                    return None
-        except requests.exceptions.Timeout:
-            if attempt < max_retries:
-                wait_time = attempt * 2
-                print(f"\nRootz upload timeout (attempt {attempt}/{max_retries}), retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                print(f"\nRootz upload timeout after {max_retries} attempts")
-                return None
-        except Exception as e:
-            if attempt < max_retries:
-                wait_time = attempt * 2
-                print(f"\nRootz error: {e} (attempt {attempt}/{max_retries}), retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                print(f"\nRootz error after {max_retries} attempts: {e}")
-                return None
+                raise RuntimeError(f"complete failed: {e}")
 
-    return None
+        return None
+    except Exception as e:
+        print(f"\nRootz multipart upload error: {e}")
+        # Free server-side state so the orphaned upload doesn't linger.
+        try:
+            requests.post(
+                f"{base}/abort",
+                json={"uploadId": upload_id, "key": key},
+                headers=headers,
+                timeout=30,
+            )
+        except Exception:
+            pass
+        return None
 
 
 def upload_folder_to_all(folder_path):
